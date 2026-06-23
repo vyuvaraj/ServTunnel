@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -38,20 +39,63 @@ type pendingRequest struct {
 	start time.Time
 }
 
+// RateLimiter is a thread-safe token-bucket rate limiter.
+type RateLimiter struct {
+	mu           sync.Mutex
+	rate         float64 // tokens per second
+	capacity     float64 // max tokens
+	tokens       float64
+	lastRefilled time.Time
+}
+
+// NewRateLimiter creates a new RateLimiter.
+func NewRateLimiter(rate, capacity float64) *RateLimiter {
+	return &RateLimiter{
+		rate:         rate,
+		capacity:     capacity,
+		tokens:       capacity,
+		lastRefilled: time.Now(),
+	}
+}
+
+// Allow returns true if a token can be consumed.
+func (rl *RateLimiter) Allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(rl.lastRefilled).Seconds()
+	rl.lastRefilled = now
+
+	rl.tokens += elapsed * rl.rate
+	if rl.tokens > rl.capacity {
+		rl.tokens = rl.capacity
+	}
+
+	if rl.tokens >= 1.0 {
+		rl.tokens -= 1.0
+		return true
+	}
+	return false
+}
+
 // tunnelConn represents a connected tunnel client.
 type tunnelConn struct {
 	subdomain string
 	conn      *websocket.Conn
 	mu        sync.Mutex // protects writes to conn
 	pending   sync.Map   // requestID → *pendingRequest
+	limiter   *RateLimiter
 }
 
 // Server is the ServTunnel relay server.
 type Server struct {
-	addr      string
-	baseDomain string // e.g., "servverse.net" or "localhost"
-	inspector *inspector.Inspector
-	httpSrv   *http.Server
+	addr        string
+	baseDomain  string // e.g., "servverse.net" or "localhost"
+	inspector   *inspector.Inspector
+	httpSrv     *http.Server
+	jwtSecret   string
+	staticToken string
 
 	mu      sync.RWMutex
 	tunnels map[string]*tunnelConn // subdomain → tunnelConn
@@ -60,10 +104,12 @@ type Server struct {
 // NewServer creates a new relay server.
 func NewServer(addr, baseDomain string, insp *inspector.Inspector) *Server {
 	return &Server{
-		addr:       addr,
-		baseDomain: baseDomain,
-		inspector:  insp,
-		tunnels:    make(map[string]*tunnelConn),
+		addr:        addr,
+		baseDomain:  baseDomain,
+		inspector:   insp,
+		jwtSecret:   os.Getenv("SERVTUNNEL_JWT_SECRET"),
+		staticToken: os.Getenv("SERVTUNNEL_TOKEN"),
+		tunnels:     make(map[string]*tunnelConn),
 	}
 }
 
@@ -93,14 +139,71 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the relay server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.mu.Lock()
+	for _, tc := range s.tunnels {
+		tc.mu.Lock()
+		if tc.conn != nil {
+			_ = tc.conn.Close()
+		}
+		tc.mu.Unlock()
+	}
+	s.mu.Unlock()
+
 	if s.httpSrv != nil {
 		return s.httpSrv.Shutdown(ctx)
 	}
 	return nil
 }
 
+// authenticate checks the incoming request against SERVTUNNEL_JWT_SECRET or SERVTUNNEL_TOKEN.
+func (s *Server) authenticate(r *http.Request) error {
+	secret := s.jwtSecret
+	token := s.staticToken
+	if secret == "" && token == "" {
+		return nil
+	}
+
+	var tokenStr string
+	if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+		var err error
+		tokenStr, err = ServShared.ExtractTokenFromHeader(authHeader)
+		if err != nil {
+			tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+			tokenStr = strings.TrimSpace(tokenStr)
+		}
+	}
+	if tokenStr == "" {
+		tokenStr = r.URL.Query().Get("token")
+	}
+
+	if tokenStr == "" {
+		return fmt.Errorf("missing token")
+	}
+
+	if token != "" && tokenStr == token {
+		return nil
+	}
+
+	if secret != "" {
+		validator := ServShared.NewAuthValidator(secret, "", "")
+		_, err := validator.ValidateToken(tokenStr)
+		if err == nil {
+			return nil
+		}
+		return fmt.Errorf("invalid token: %w", err)
+	}
+
+	return fmt.Errorf("unauthorized")
+}
+
 // handleWebSocket upgrades a client connection and manages its lifecycle.
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	if err := s.authenticate(r); err != nil {
+		log.Printf("Authentication failed: %v", err)
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade failed: %v", err)
@@ -140,6 +243,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	tc := &tunnelConn{
 		subdomain: subdomain,
 		conn:      conn,
+		limiter:   NewRateLimiter(50, 100),
 	}
 	s.tunnels[subdomain] = tc
 	s.mu.Unlock()
@@ -218,6 +322,14 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 	if !exists {
 		otel.EndSpan(span, fmt.Errorf("tunnel not found: %s", subdomain), nil)
 		http.Error(w, fmt.Sprintf(`{"error":"tunnel %q not found"}`, subdomain), http.StatusBadGateway)
+		return
+	}
+
+	if !tc.limiter.Allow() {
+		otel.EndSpan(span, fmt.Errorf("rate limit exceeded"), nil)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte(`{"error":"rate limit exceeded"}`))
 		return
 	}
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,20 +27,22 @@ import (
 
 // Client is the ServTunnel tunnel client.
 type Client struct {
-	localAddr string // e.g., "localhost:8080"
-	relayURL  string // WebSocket URL of the relay
-	subdomain string // requested subdomain (empty for auto-assign)
-	conn      *websocket.Conn
-	mu        sync.Mutex
+	localAddr  string // e.g., "localhost:8080"
+	relayURL   string // WebSocket URL of the relay
+	subdomain  string // requested subdomain (empty for auto-assign)
+	token      string // registration token
+	conn       *websocket.Conn
+	mu         sync.Mutex
 	httpClient *http.Client
 }
 
 // NewClient creates a new tunnel client.
-func NewClient(localAddr, relayURL, subdomain string) *Client {
+func NewClient(localAddr, relayURL, subdomain, token string) *Client {
 	return &Client{
-		localAddr: localAddr,
-		relayURL:  relayURL,
-		subdomain: subdomain,
+		localAddr:  localAddr,
+		relayURL:   relayURL,
+		subdomain:  subdomain,
+		token:      token,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -59,59 +62,6 @@ func (c *Client) Run() error {
 	fmt.Printf("  Local service:  http://%s\n", c.localAddr)
 	fmt.Printf("  Relay server:   %s\n", c.relayURL)
 	fmt.Println()
-	fmt.Println("  Connecting...")
-
-	// Connect to relay.
-	conn, _, err := websocket.DefaultDialer.Dial(c.relayURL, nil)
-	if err != nil {
-		return fmt.Errorf("failed to connect to relay: %w", err)
-	}
-	c.conn = conn
-
-	// Send registration.
-	regMsg := tunnel.Envelope{
-		Type: tunnel.TypeRegister,
-		Control: &tunnel.ControlMessage{
-			Subdomain: c.subdomain,
-		},
-	}
-	if err := conn.WriteJSON(regMsg); err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to send registration: %w", err)
-	}
-
-	// Wait for confirmation.
-	var regResp tunnel.Envelope
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if err := conn.ReadJSON(&regResp); err != nil {
-		conn.Close()
-		return fmt.Errorf("failed to read registration response: %w", err)
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	if regResp.Type == tunnel.TypeError {
-		conn.Close()
-		errMsg := "unknown error"
-		if regResp.Control != nil {
-			errMsg = regResp.Control.Error
-		}
-		return fmt.Errorf("registration failed: %s", errMsg)
-	}
-
-	if regResp.Type != tunnel.TypeRegistered || regResp.Control == nil {
-		conn.Close()
-		return fmt.Errorf("unexpected response type: %s", regResp.Type)
-	}
-
-	fmt.Printf("  ✓ Tunnel established!\n")
-	fmt.Println()
-	fmt.Printf("  Public URL:     %s\n", regResp.Control.PublicURL)
-	fmt.Printf("  Subdomain:      %s\n", regResp.Control.Subdomain)
-	fmt.Println()
-	fmt.Println("  ─────────────────────────────────────────")
-	fmt.Println("  Forwarding requests... (Ctrl+C to stop)")
-	fmt.Println("  ─────────────────────────────────────────")
-	fmt.Println()
 
 	// Handle shutdown signals.
 	stopChan := make(chan os.Signal, 1)
@@ -121,26 +71,152 @@ func (c *Client) Run() error {
 		<-stopChan
 		fmt.Println("\n  Shutting down tunnel...")
 		c.mu.Lock()
-		conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		if c.conn != nil {
+			_ = c.conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			c.conn.Close()
+		}
 		c.mu.Unlock()
-		conn.Close()
 		os.Exit(0)
 	}()
 
-	// Start keepalive.
-	go c.keepalive()
+	backoff := 100 * time.Millisecond
+	maxBackoff := 10 * time.Second
 
-	// Read and process requests.
-	c.readLoop()
-	return nil
+	for {
+		fmt.Println("  Connecting...")
+		var header http.Header
+		if c.token != "" {
+			header = make(http.Header)
+			header.Set("Authorization", "Bearer "+c.token)
+		}
+		u := c.relayURL
+		if c.token != "" {
+			if strings.Contains(u, "?") {
+				u += "&token=" + c.token
+			} else {
+				u += "?token=" + c.token
+			}
+		}
+
+		conn, _, err := websocket.DefaultDialer.Dial(u, header)
+		if err != nil {
+			fmt.Printf("  failed to connect to relay: %v\n", err)
+			c.sleepWithJitter(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		c.mu.Lock()
+		c.conn = conn
+		c.mu.Unlock()
+
+		// Send registration message.
+		regMsg := tunnel.Envelope{
+			Type: tunnel.TypeRegister,
+			Control: &tunnel.ControlMessage{
+				Subdomain: c.subdomain,
+			},
+		}
+		if err := conn.WriteJSON(regMsg); err != nil {
+			fmt.Printf("  failed to send registration: %v\n", err)
+			conn.Close()
+			c.sleepWithJitter(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Wait for confirmation.
+		var regResp tunnel.Envelope
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if err := conn.ReadJSON(&regResp); err != nil {
+			fmt.Printf("  failed to read registration response: %v\n", err)
+			conn.Close()
+			c.sleepWithJitter(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		conn.SetReadDeadline(time.Time{}) // clear deadline
+
+		if regResp.Type == tunnel.TypeError {
+			conn.Close()
+			errMsg := "unknown error"
+			if regResp.Control != nil {
+				errMsg = regResp.Control.Error
+			}
+			fmt.Printf("  registration failed: %s\n", errMsg)
+			c.sleepWithJitter(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		if regResp.Type != tunnel.TypeRegistered || regResp.Control == nil {
+			conn.Close()
+			fmt.Printf("  unexpected response type: %s\n", regResp.Type)
+			c.sleepWithJitter(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+
+		// Reset backoff on successful connection.
+		backoff = 100 * time.Millisecond
+
+		fmt.Printf("  ✓ Tunnel established!\n")
+		fmt.Println()
+		fmt.Printf("  Public URL:     %s\n", regResp.Control.PublicURL)
+		fmt.Printf("  Subdomain:      %s\n", regResp.Control.Subdomain)
+		fmt.Println()
+		fmt.Println("  ─────────────────────────────────────────")
+		fmt.Println("  Forwarding requests... (Ctrl+C to stop)")
+		fmt.Println("  ─────────────────────────────────────────")
+		fmt.Println()
+
+		keepaliveDone := make(chan struct{})
+		go c.keepalive(conn, keepaliveDone)
+
+		// Read and process requests.
+		c.readLoop(conn)
+
+		// Cleanup on connection drop.
+		close(keepaliveDone)
+		conn.Close()
+
+		c.mu.Lock()
+		if c.conn == conn {
+			c.conn = nil
+		}
+		c.mu.Unlock()
+
+		fmt.Println("  Connection lost, reconnecting...")
+	}
+}
+
+func (c *Client) sleepWithJitter(d time.Duration) {
+	// Add up to 20% jitter
+	jitter := time.Duration(rand.Int63n(int64(d) / 5))
+	time.Sleep(d + jitter)
 }
 
 // readLoop reads incoming tunnel requests and dispatches them.
-func (c *Client) readLoop() {
+func (c *Client) readLoop(conn *websocket.Conn) {
 	for {
 		var env tunnel.Envelope
-		if err := c.conn.ReadJSON(&env); err != nil {
+		if err := conn.ReadJSON(&env); err != nil {
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				return
 			}
@@ -150,10 +226,10 @@ func (c *Client) readLoop() {
 
 		switch env.Type {
 		case tunnel.TypeRequest:
-			go c.handleRequest(env)
+			go c.handleRequest(conn, env)
 		case tunnel.TypePing:
 			c.mu.Lock()
-			_ = c.conn.WriteJSON(tunnel.Envelope{Type: tunnel.TypePong})
+			_ = conn.WriteJSON(tunnel.Envelope{Type: tunnel.TypePong})
 			c.mu.Unlock()
 		case tunnel.TypeError:
 			errMsg := "unknown"
@@ -166,7 +242,7 @@ func (c *Client) readLoop() {
 }
 
 // handleRequest proxies a single request to the local service.
-func (c *Client) handleRequest(env tunnel.Envelope) {
+func (c *Client) handleRequest(conn *websocket.Conn, env tunnel.Envelope) {
 	if env.Request == nil {
 		return
 	}
@@ -189,7 +265,7 @@ func (c *Client) handleRequest(env tunnel.Envelope) {
 	// Create HTTP request.
 	httpReq, err := http.NewRequest(req.Method, localURL, bodyReader)
 	if err != nil {
-		c.sendErrorResponse(env.RequestID, 502, "failed to create request")
+		c.sendErrorResponse(conn, env.RequestID, 502, "failed to create request")
 		return
 	}
 
@@ -209,7 +285,7 @@ func (c *Client) handleRequest(env tunnel.Envelope) {
 		latency := time.Since(start)
 		fmt.Printf("  %s %-6s %-30s → ERR  (%dms) %v\n",
 			time.Now().Format("15:04:05"), req.Method, req.Path, latency.Milliseconds(), err)
-		c.sendErrorResponse(env.RequestID, 502, "local service error: "+err.Error())
+		c.sendErrorResponse(conn, env.RequestID, 502, "local service error: "+err.Error())
 		return
 	}
 	defer resp.Body.Close()
@@ -254,12 +330,12 @@ func (c *Client) handleRequest(env tunnel.Envelope) {
 	}
 
 	c.mu.Lock()
-	_ = c.conn.WriteJSON(respEnv)
+	_ = conn.WriteJSON(respEnv)
 	c.mu.Unlock()
 }
 
 // sendErrorResponse sends an error response back through the tunnel.
-func (c *Client) sendErrorResponse(requestID string, status int, msg string) {
+func (c *Client) sendErrorResponse(conn *websocket.Conn, requestID string, status int, msg string) {
 	body := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"error":"%s"}`, msg)))
 	respEnv := tunnel.Envelope{
 		Type:      tunnel.TypeResponse,
@@ -271,19 +347,24 @@ func (c *Client) sendErrorResponse(requestID string, status int, msg string) {
 		},
 	}
 	c.mu.Lock()
-	_ = c.conn.WriteJSON(respEnv)
+	_ = conn.WriteJSON(respEnv)
 	c.mu.Unlock()
 }
 
 // keepalive sends periodic pings to keep the WebSocket connection alive.
-func (c *Client) keepalive() {
+func (c *Client) keepalive(conn *websocket.Conn, done chan struct{}) {
 	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		c.mu.Lock()
-		err := c.conn.WriteJSON(tunnel.Envelope{Type: tunnel.TypePing})
-		c.mu.Unlock()
-		if err != nil {
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			err := conn.WriteJSON(tunnel.Envelope{Type: tunnel.TypePing})
+			c.mu.Unlock()
+			if err != nil {
+				return
+			}
+		case <-done:
 			return
 		}
 	}

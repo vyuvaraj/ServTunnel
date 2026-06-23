@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"servtunnel/pkg/client"
 	"servtunnel/pkg/inspector"
 	"servtunnel/pkg/server"
 	"servtunnel/pkg/tunnel"
@@ -399,5 +401,195 @@ func TestListTunnelsEmpty(t *testing.T) {
 	count := int(result["count"].(float64))
 	if count != 0 {
 		t.Errorf("count = %d, want 0", count)
+	}
+}
+
+func TestTokenHandshakeValidation(t *testing.T) {
+	t.Setenv("SERVTUNNEL_TOKEN", "super-secret-token")
+
+	// Start relay server on a random port.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	relayAddr := listener.Addr().String()
+	listener.Close()
+
+	insp := inspector.New(100)
+	relaySrv := server.NewServer(":"+strings.Split(relayAddr, ":")[1], "localhost", insp)
+	go relaySrv.Start()
+	time.Sleep(200 * time.Millisecond) // wait for relay to start
+
+	// 1. Dial without token -> Should fail with 401 Unauthorized
+	wsURL := fmt.Sprintf("ws://%s/ws/connect", relayAddr)
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err == nil {
+		t.Fatal("expected dial to fail due to missing token")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized status, got %v", resp)
+	}
+
+	// 2. Dial with invalid token -> Should fail with 401 Unauthorized
+	wsURLWithBadToken := fmt.Sprintf("ws://%s/ws/connect?token=bad-token", relayAddr)
+	_, resp, err = websocket.DefaultDialer.Dial(wsURLWithBadToken, nil)
+	if err == nil {
+		t.Fatal("expected dial to fail due to bad token")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized status, got %v", resp)
+	}
+
+	// 3. Dial with valid token -> Should succeed
+	wsURLWithGoodToken := fmt.Sprintf("ws://%s/ws/connect?token=super-secret-token", relayAddr)
+	ws, resp, err := websocket.DefaultDialer.Dial(wsURLWithGoodToken, nil)
+	if err != nil {
+		t.Fatalf("expected dial to succeed with valid token: %v", err)
+	}
+	defer ws.Close()
+	if resp.StatusCode != 101 {
+		t.Errorf("expected 101 Switching Protocols, got %d", resp.StatusCode)
+	}
+}
+
+func TestRateLimiting(t *testing.T) {
+	// Start relay server on a random port.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	relayAddr := listener.Addr().String()
+	listener.Close()
+
+	insp := inspector.New(100)
+	relaySrv := server.NewServer(":"+strings.Split(relayAddr, ":")[1], "localhost", insp)
+	go relaySrv.Start()
+	time.Sleep(200 * time.Millisecond)
+
+	// Connect a WebSocket client to register "ratelimit" subdomain.
+	wsURL := fmt.Sprintf("ws://%s/ws/connect", relayAddr)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer ws.Close()
+
+	err = ws.WriteJSON(tunnel.Envelope{
+		Type:    tunnel.TypeRegister,
+		Control: &tunnel.ControlMessage{Subdomain: "ratelimit"},
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var regResp tunnel.Envelope
+	if err := ws.ReadJSON(&regResp); err != nil {
+		t.Fatalf("read reg response: %v", err)
+	}
+
+	// Read and immediately respond to tunnel requests in background
+	go func() {
+		for {
+			var env tunnel.Envelope
+			if err := ws.ReadJSON(&env); err != nil {
+				return
+			}
+			if env.Type == tunnel.TypeRequest {
+				_ = ws.WriteJSON(tunnel.Envelope{
+					Type:      tunnel.TypeResponse,
+					RequestID: env.RequestID,
+					Response: &tunnel.TunnelResponse{
+						StatusCode: 200,
+						Body:       "",
+					},
+				})
+			}
+		}
+	}()
+
+	// Send requests rapidly. The bucket has 100 capacity.
+	relayPort := strings.Split(relayAddr, ":")[1]
+	reqURL := fmt.Sprintf("http://127.0.0.1:%s/api/test", relayPort)
+
+	client := &http.Client{Timeout: 2 * time.Second}
+
+	// Send 110 requests. We expect at least one 429.
+	has429 := false
+	for i := 0; i < 110; i++ {
+		httpReq, _ := http.NewRequest("GET", reqURL, nil)
+		httpReq.Host = fmt.Sprintf("ratelimit.localhost:%s", relayPort)
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			has429 = true
+			resp.Body.Close()
+			break
+		}
+		resp.Body.Close()
+	}
+
+	if !has429 {
+		t.Error("expected at least one request to be rate limited (429), but none were")
+	}
+}
+
+func TestClientReconnection(t *testing.T) {
+	// Find a free port
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := strings.Split(l.Addr().String(), ":")[1]
+	l.Close()
+
+	addr := "127.0.0.1:" + port
+
+	// 1. Start the first relay server
+	insp1 := inspector.New(10)
+	srv1 := server.NewServer(":"+port, "localhost", insp1)
+	go srv1.Start()
+	time.Sleep(200 * time.Millisecond)
+
+	// 2. Start the client
+	relayURL := fmt.Sprintf("ws://%s/ws/connect", addr)
+	c := client.NewClient("127.0.0.1:9090", relayURL, "recon-test", "")
+
+	// Run client in background
+	go func() {
+		_ = c.Run()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	srv1.Shutdown(context.Background())
+	time.Sleep(500 * time.Millisecond) // wait for connection drop and backoff
+
+	// 3. Start a new server on the same port
+	insp2 := inspector.New(10)
+	srv2 := server.NewServer(":"+port, "localhost", insp2)
+	go srv2.Start()
+
+	// Wait for client to reconnect
+	reconnected := false
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		req, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/api/tunnels", addr), nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		resp.Body.Close()
+
+		if count, ok := result["count"].(float64); ok && count > 0 {
+			reconnected = true
+			break
+		}
+	}
+
+	if !reconnected {
+		t.Error("client failed to reconnect after server restart")
 	}
 }

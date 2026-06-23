@@ -95,12 +95,14 @@ func runClient() {
 		fmt.Fprintf(os.Stderr, "\nOptions:\n")
 		fmt.Fprintf(os.Stderr, "  --relay <url>       Relay server WebSocket URL (default: ws://localhost:8443/ws/connect)\n")
 		fmt.Fprintf(os.Stderr, "  --subdomain <name>  Requested subdomain (default: auto-generated)\n")
+		fmt.Fprintf(os.Stderr, "  --token <token>     Authentication token\n")
 		os.Exit(1)
 	}
 
 	localPort := os.Args[2]
 	relayURL := getEnvOrDefault("SERVTUNNEL_RELAY", "ws://localhost:8443/ws/connect")
 	subdomain := ""
+	token := getEnvOrDefault("SERVTUNNEL_TOKEN", "")
 
 	for i := 3; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -114,11 +116,16 @@ func runClient() {
 				subdomain = os.Args[i+1]
 				i++
 			}
+		case "--token", "-t":
+			if i+1 < len(os.Args) {
+				token = os.Args[i+1]
+				i++
+			}
 		}
 	}
 
 	localAddr := "localhost:" + localPort
-	c := client.NewClient(localAddr, relayURL, subdomain)
+	c := client.NewClient(localAddr, relayURL, subdomain, token)
 
 	if err := c.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -144,6 +151,7 @@ func printUsage() {
 	fmt.Println("  servtunnel client <local-port> [options]")
 	fmt.Println("  --relay, -r <url>         Relay WebSocket URL (default: ws://localhost:8443/ws/connect)")
 	fmt.Println("  --subdomain, -s <name>    Requested subdomain (default: auto-generated)")
+	fmt.Println("  --token, -t <token>       Authentication token")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  servtunnel server --port 8443 --domain servverse.net")
