@@ -969,4 +969,82 @@ func TestCustomDomainMapping(t *testing.T) {
 	}
 }
 
+func TestBandwidthQuota(t *testing.T) {
+	l1, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := strings.Split(l1.Addr().String(), ":")[1]
+	l1.Close()
+
+	addr := "127.0.0.1:" + port
+
+	insp := inspector.New(10)
+	srv := server.NewServer(":"+port, "localhost", insp)
+	go srv.Start()
+	time.Sleep(150 * time.Millisecond)
+	defer srv.Shutdown(context.Background())
+
+	// Start local server to receive request
+	l2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	localPort := strings.Split(l2.Addr().String(), ":")[1]
+	l2.Close()
+
+	localMux := http.NewServeMux()
+	localMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Test-Header", "yes")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("responsebody"))
+	})
+	localSrv := &http.Server{Addr: "127.0.0.1:" + localPort, Handler: localMux}
+	go localSrv.ListenAndServe()
+	defer localSrv.Shutdown(context.Background())
+
+	relayURL := fmt.Sprintf("ws://%s/ws/connect", addr)
+	c := client.NewClient("127.0.0.1:"+localPort, relayURL, "quotatest", "", "", "0")
+	go c.Run()
+	time.Sleep(150 * time.Millisecond)
+
+	// Send request through tunnel
+	reqBody := "hello world" // 11 bytes
+	req, _ := http.NewRequest("POST", "http://"+addr+"/api/test", strings.NewReader(reqBody))
+	req.Host = "quotatest.localhost:" + port
+	
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	// Query /api/tunnels
+	reqTunnels, _ := http.NewRequest("GET", "http://"+addr+"/api/tunnels", nil)
+	respTunnels, err := http.DefaultClient.Do(reqTunnels)
+	if err != nil {
+		t.Fatalf("failed to query /api/tunnels: %v", err)
+	}
+	defer respTunnels.Body.Close()
+
+	var data map[string]interface{}
+	json.NewDecoder(respTunnels.Body).Decode(&data)
+	tunnelsList, _ := data["tunnels"].([]interface{})
+	if len(tunnelsList) == 0 {
+		t.Fatalf("no active tunnels found in API response")
+	}
+
+	tunnelInfo, _ := tunnelsList[0].(map[string]interface{})
+	bytesRead, _ := tunnelInfo["bytes_read"].(float64)
+	bytesWritten, _ := tunnelInfo["bytes_written"].(float64)
+
+	if bytesRead != 11 {
+		t.Errorf("bytes_read = %v, want 11", bytesRead)
+	}
+	if bytesWritten != 12 { // "responsebody" is 12 bytes
+		t.Errorf("bytes_written = %v, want 12", bytesWritten)
+	}
+}
+
+
 

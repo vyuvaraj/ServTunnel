@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"servtunnel/pkg/inspector"
@@ -88,6 +89,9 @@ type tunnelConn struct {
 	mu           sync.Mutex // protects writes to conn
 	pending      sync.Map   // requestID → *pendingRequest
 	limiter      *RateLimiter
+	bytesRead    int64
+	bytesWritten int64
+	quotaLimit   int64
 }
 
 // Server is the ServTunnel relay server.
@@ -281,6 +285,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		customDomain: customDomain,
 		conn:         conn,
 		limiter:      NewRateLimiter(50, 100),
+		quotaLimit:   100 * 1024 * 1024, // 100 MB default quota
 	}
 	s.tunnels[subdomain] = tc
 	if customDomain != "" {
@@ -389,6 +394,17 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check bandwidth limit
+	if atomic.LoadInt64(&tc.bytesRead)+atomic.LoadInt64(&tc.bytesWritten) > tc.quotaLimit {
+		otel.EndSpan(span, fmt.Errorf("bandwidth quota exceeded"), nil)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusTooManyRequests) // 429
+		w.Write([]byte(`{"error":"bandwidth quota exceeded"}`))
+		return
+	}
+
+	// Rate limiting check
 	if !tc.limiter.Allow() {
 		otel.EndSpan(span, fmt.Errorf("rate limit exceeded"), nil)
 		w.Header().Set("Content-Type", "application/json")
@@ -405,6 +421,7 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		if len(bodyBytes) > 0 {
 			bodyB64 = base64.StdEncoding.EncodeToString(bodyBytes)
+			atomic.AddInt64(&tc.bytesRead, int64(len(bodyBytes)))
 		}
 	}
 
@@ -458,14 +475,26 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		for k, v := range resp.Response.Headers {
 			w.Header().Set(k, v)
 		}
+		// Announce trailers
+		for k := range resp.Response.Trailers {
+			w.Header().Add("Trailer", k)
+		}
 		w.WriteHeader(resp.Response.StatusCode)
 
 		// Write response body.
+		var writtenBytes int64
 		if resp.Response.Body != "" {
 			bodyBytes, err := base64.StdEncoding.DecodeString(resp.Response.Body)
 			if err == nil {
 				w.Write(bodyBytes)
+				writtenBytes = int64(len(bodyBytes))
+				atomic.AddInt64(&tc.bytesWritten, writtenBytes)
 			}
+		}
+
+		// Set trailers after writing the body
+		for k, v := range resp.Response.Trailers {
+			w.Header().Set(k, v)
 		}
 
 		// Record in inspector.
@@ -507,12 +536,15 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
-	tunnels := make([]map[string]string, 0, len(s.tunnels))
+	tunnels := make([]map[string]interface{}, 0, len(s.tunnels))
 	for sub, tc := range s.tunnels {
-		tunnels = append(tunnels, map[string]string{
+		tunnels = append(tunnels, map[string]interface{}{
 			"subdomain":     sub,
 			"custom_domain": tc.customDomain,
 			"public_url":    fmt.Sprintf("http://%s.%s%s", sub, s.baseDomain, s.addr),
+			"bytes_read":    atomic.LoadInt64(&tc.bytesRead),
+			"bytes_written": atomic.LoadInt64(&tc.bytesWritten),
+			"quota_limit":   tc.quotaLimit,
 		})
 	}
 	s.mu.RUnlock()

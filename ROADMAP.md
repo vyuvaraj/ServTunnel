@@ -47,9 +47,9 @@
 ### 🔲 Phase 3: Advanced Features
 - [ ] Multiple simultaneous tunnels per client
 - [ ] TCP tunneling (not just HTTP)
-- [ ] gRPC tunneling support
+- [x] gRPC tunneling support
 - [ ] Tunnel sharing (team access to a tunnel)
-- [ ] Bandwidth monitoring and quotas
+- [x] Bandwidth monitoring and quotas
 - [ ] ServConsole integration (view tunnels in dashboard)
 - [x] Webhook signature verification helpers
 

@@ -352,6 +352,14 @@ func (c *Client) handleRequest(conn *websocket.Conn, env tunnel.Envelope) {
 		respHeaders[k] = vals[0]
 	}
 
+	// Flatten response trailers.
+	respTrailers := make(map[string]string)
+	for k, vals := range resp.Trailer {
+		if len(vals) > 0 {
+			respTrailers[k] = vals[0]
+		}
+	}
+
 	latency := time.Since(start)
 
 	if c.inspector != nil && inspectReqID != "" {
@@ -379,6 +387,7 @@ func (c *Client) handleRequest(conn *websocket.Conn, env tunnel.Envelope) {
 			StatusCode: resp.StatusCode,
 			Headers:    respHeaders,
 			Body:       respBodyB64,
+			Trailers:   respTrailers,
 		},
 	}
 

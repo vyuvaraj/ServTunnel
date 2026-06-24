@@ -62,4 +62,5 @@ type TunnelResponse struct {
 	StatusCode int               `json:"status_code"`
 	Headers    map[string]string `json:"headers"`
 	Body       string            `json:"body,omitempty"` // base64-encoded for binary safety
+	Trailers   map[string]string `json:"trailers,omitempty"`
 }
