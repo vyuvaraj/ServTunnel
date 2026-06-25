@@ -1281,6 +1281,56 @@ func TestReservedSubdomains(t *testing.T) {
 	}
 }
 
+func TestTLSServerConfig(t *testing.T) {
+	t.Run("TLS Env Check", func(t *testing.T) {
+		t.Setenv("SERVTUNNEL_TLS_CERT", "nonexistent.crt")
+		t.Setenv("SERVTUNNEL_TLS_KEY", "nonexistent.key")
+		
+		insp := inspector.New(10)
+		s := server.NewServer(":9999", "localhost", insp)
+		
+		errChan := make(chan error, 1)
+		go func() {
+			errChan <- s.Start()
+		}()
+		
+		select {
+		case err := <-errChan:
+			if err == nil {
+				t.Fatal("expected error starting server with nonexistent TLS files, got nil")
+			}
+			if !strings.Contains(err.Error(), "open nonexistent.crt") && !strings.Contains(err.Error(), "nonexistent") {
+				t.Errorf("unexpected error: %v", err)
+			}
+		case <-time.After(1 * time.Second):
+			s.Shutdown(context.Background())
+			t.Fatal("expected server to exit immediately with error")
+		}
+	})
+
+	t.Run("AutoTLS Env Check", func(t *testing.T) {
+		t.Setenv("SERVTUNNEL_AUTOCERT", "true")
+		t.Setenv("SERVTUNNEL_AUTOCERT_DOMAIN", "example.com")
+		
+		insp := inspector.New(10)
+		s := server.NewServer(":9999", "localhost", insp)
+		
+		errChan := make(chan error, 1)
+		go func() {
+			errChan <- s.Start()
+		}()
+		
+		select {
+		case err := <-errChan:
+			if err != nil && !strings.Contains(err.Error(), "bind") && !strings.Contains(err.Error(), "permission") {
+				t.Logf("started and errored: %v", err)
+			}
+		case <-time.After(500 * time.Millisecond):
+			s.Shutdown(context.Background())
+		}
+	})
+}
+
 
 
 

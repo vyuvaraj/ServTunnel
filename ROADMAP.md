@@ -24,7 +24,7 @@
 ---
 
 ### 🔲 Phase 1: Production Hardening
-- [ ] TLS termination (auto-provisioned Let's Encrypt certs)
+- [x] TLS termination (auto-provisioned Let's Encrypt certs)
 - [x] Wildcard DNS setup guide for `*.servverse.net`
 - [x] Authentication (API key or token for client registration)
 - [x] Rate limiting (per-tunnel request rate)

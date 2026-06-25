@@ -27,6 +27,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/vyuvaraj/ServShared"
+	"golang.org/x/crypto/acme/autocert"
 )
 
 var upgrader = websocket.Upgrader{
@@ -167,6 +168,27 @@ func (s *Server) Start() error {
 	s.httpSrv = &http.Server{
 		Addr:    s.addr,
 		Handler: mux,
+	}
+
+	tlsCert := os.Getenv("SERVTUNNEL_TLS_CERT")
+	tlsKey := os.Getenv("SERVTUNNEL_TLS_KEY")
+	autocertEnabled := os.Getenv("SERVTUNNEL_AUTOCERT") == "true"
+	autocertDomain := os.Getenv("SERVTUNNEL_AUTOCERT_DOMAIN")
+
+	if autocertEnabled && autocertDomain != "" {
+		certManager := &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(autocertDomain, "*."+autocertDomain),
+			Cache:      autocert.DirCache("certs"),
+		}
+		s.httpSrv.TLSConfig = certManager.TLSConfig()
+		log.Printf("ServTunnel relay listening with Auto-TLS (Let's Encrypt) on %s (base domain: %s)", s.addr, s.baseDomain)
+		return s.httpSrv.ListenAndServeTLS("", "")
+	}
+
+	if tlsCert != "" && tlsKey != "" {
+		log.Printf("ServTunnel relay listening with TLS on %s (base domain: %s)", s.addr, s.baseDomain)
+		return s.httpSrv.ListenAndServeTLS(tlsCert, tlsKey)
 	}
 
 	log.Printf("ServTunnel relay listening on %s (base domain: %s)", s.addr, s.baseDomain)
