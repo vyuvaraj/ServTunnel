@@ -60,3 +60,14 @@
 - [x] Persistent tunnel names (reserved subdomains)
 - [ ] Usage analytics and billing integration
 - [ ] Enterprise features (SSO, audit logging, IP allowlists)
+
+
+## Phase 4: Enterprise Tunneling (Next Level)
+- [ ] **Team Collaboration**: Share tunnel access with team members via token-based invite links.
+- [ ] **Persistent Tunnels**: Keep tunnels alive across client restarts with session resumption.
+- [ ] **Custom Domain Mapping**: Map production domains to local tunnels for realistic testing.
+- [ ] **Request Recording & Replay**: Record all requests through tunnel, replay them later for debugging.
+- [ ] **Bandwidth Throttling**: Simulate slow networks (3G, satellite) for mobile testing.
+- [ ] **Tunnel Metrics in ServConsole**: Live throughput, latency, and connection count dashboard.
+- [ ] **TCP Tunnel Support**: Tunnel raw TCP (databases, Redis, gRPC) — not just HTTP.
+- [ ] **Webhook Relay Mode**: Receive webhooks on public URL, replay to multiple local services.
