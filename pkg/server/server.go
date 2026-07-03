@@ -160,6 +160,7 @@ func (s *Server) Start() error {
 	// Management endpoints (accessed directly, not via subdomain)
 	mux.HandleFunc("/healthz", ServShared.HealthzHandler)
 	mux.HandleFunc("/readyz", ServShared.ReadyzHandler)
+	mux.HandleFunc("/api/version", ServShared.VersionHandler("servtunnel", "1.0.0"))
 	mux.HandleFunc("/ws/connect", s.handleWebSocket)
 	mux.HandleFunc("/api/tunnels", s.handleListTunnels)
 	mux.HandleFunc("/api/inspect", s.inspector.HandleList)
