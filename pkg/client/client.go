@@ -46,6 +46,7 @@ type Client struct {
 	tcpPort      int                  // requested TCP relay port
 	tcpConns     map[string]net.Conn  // active downstream TCP connections (session -> net.Conn)
 	throttleBytesPerSec int64         // bandwidth limit in bytes/sec
+	resumptionToken     string        // persistent tunnel session resumption token
 }
 
 // NewClient creates a new tunnel client.
@@ -200,10 +201,11 @@ func (c *Client) Run() error {
 		regMsg := tunnel.Envelope{
 			Type: tunnel.TypeRegister,
 			Control: &tunnel.ControlMessage{
-				Subdomain:    c.subdomain,
-				CustomDomain: c.customDomain,
-				SharingAuth:  c.shareAuth,
-				TCPPort:      c.tcpPort,
+				Subdomain:       c.subdomain,
+				CustomDomain:    c.customDomain,
+				SharingAuth:     c.shareAuth,
+				TCPPort:         c.tcpPort,
+				ResumptionToken: c.resumptionToken,
 			},
 		}
 		if err := conn.WriteJSON(regMsg); err != nil {
@@ -257,6 +259,11 @@ func (c *Client) Run() error {
 			}
 			continue
 		}
+
+		c.mu.Lock()
+		c.resumptionToken = regResp.Control.ResumptionToken
+		c.subdomain = regResp.Control.Subdomain
+		c.mu.Unlock()
 
 		// Reset backoff on successful connection.
 		backoff = 100 * time.Millisecond

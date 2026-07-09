@@ -43,12 +43,13 @@ type Envelope struct {
 
 // ControlMessage carries registration and error information.
 type ControlMessage struct {
-	Subdomain    string `json:"subdomain,omitempty"`
-	CustomDomain string `json:"custom_domain,omitempty"`
-	PublicURL    string `json:"public_url,omitempty"`
-	Error        string `json:"error,omitempty"`
-	SharingAuth  string `json:"sharing_auth,omitempty"`
-	TCPPort      int    `json:"tcp_port,omitempty"` // Requested TCP port for TCP Tunneling
+	Subdomain       string `json:"subdomain,omitempty"`
+	CustomDomain    string `json:"custom_domain,omitempty"`
+	PublicURL       string `json:"public_url,omitempty"`
+	Error           string `json:"error,omitempty"`
+	SharingAuth     string `json:"sharing_auth,omitempty"`
+	TCPPort         int    `json:"tcp_port,omitempty"` // Requested TCP port for TCP Tunneling
+	ResumptionToken string `json:"resumption_token,omitempty"`
 }
 
 // TunnelRequest represents an incoming HTTP or raw TCP connection forwarded through the tunnel.

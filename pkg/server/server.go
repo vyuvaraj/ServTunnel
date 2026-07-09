@@ -29,6 +29,9 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/vyuvaraj/ServShared"
 	"golang.org/x/crypto/acme/autocert"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 var upgrader = websocket.Upgrader{
@@ -112,6 +115,7 @@ type Server struct {
 	tunnels       map[string]*tunnelConn // subdomain → tunnelConn
 	customTunnels map[string]*tunnelConn // customDomain → tunnelConn
 	tcpListeners  map[int]net.Listener   // port → net.Listener (for active TCP tunnels)
+	resumptionTokens map[string]string   // subdomain → resumptionToken
 }
 
 // NewServer creates a new relay server.
@@ -150,6 +154,7 @@ func NewServer(addr, baseDomain string, insp *inspector.Inspector) *Server {
 		tunnels:            make(map[string]*tunnelConn),
 		customTunnels:      make(map[string]*tunnelConn),
 		tcpListeners:       make(map[int]net.Listener),
+		resumptionTokens:   make(map[string]string),
 	}
 }
 
@@ -163,6 +168,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/version", ServShared.VersionHandler("servtunnel", "1.0.0"))
 	mux.HandleFunc("/ws/connect", s.handleWebSocket)
 	mux.HandleFunc("/api/tunnels", s.handleListTunnels)
+	mux.HandleFunc("/api/tunnels/", s.handleTunnelsSubroutes)
 	mux.HandleFunc("/api/inspect", s.inspector.HandleList)
 	mux.HandleFunc("/api/inspect/", s.handleInspectEntry)
 
@@ -294,39 +300,64 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	subdomain := sanitizeSubdomain(env.Control.Subdomain)
-	if subdomain == "" {
-		for {
-			subdomain = generateSubdomain()
-			s.mu.RLock()
-			_, exists := s.tunnels[subdomain]
-			_, isReserved := s.reservedSubdomains[subdomain]
-			s.mu.RUnlock()
-			if !exists && !isReserved {
-				break
-			}
-		}
-	} else {
-		// Check if the subdomain is reserved
-		s.mu.RLock()
-		expectedToken, isReserved := s.reservedSubdomains[subdomain]
-		s.mu.RUnlock()
-		if isReserved {
-			var tokenUsed string
-			if authHeader := r.Header.Get("Authorization"); authHeader != "" {
-				var err error
-				tokenUsed, err = ServShared.ExtractTokenFromHeader(authHeader)
-				if err != nil {
-					tokenUsed = strings.TrimPrefix(authHeader, "Bearer ")
-					tokenUsed = strings.TrimSpace(tokenUsed)
+	
+	// Check for resumption
+	resuming := false
+	if env.Control.ResumptionToken != "" && subdomain != "" {
+		s.mu.Lock()
+		token, exists := s.resumptionTokens[subdomain]
+		if exists && token == env.Control.ResumptionToken {
+			resuming = true
+			if oldTc, active := s.tunnels[subdomain]; active {
+				oldTc.mu.Lock()
+				if oldTc.conn != nil {
+					_ = oldTc.conn.Close()
+				}
+				oldTc.mu.Unlock()
+				delete(s.tunnels, subdomain)
+				if oldTc.customDomain != "" {
+					delete(s.customTunnels, oldTc.customDomain)
 				}
 			}
-			if tokenUsed == "" {
-				tokenUsed = r.URL.Query().Get("token")
+		}
+		s.mu.Unlock()
+	}
+
+	if !resuming {
+		if subdomain == "" {
+			for {
+				subdomain = generateSubdomain()
+				s.mu.RLock()
+				_, exists := s.tunnels[subdomain]
+				_, isReserved := s.reservedSubdomains[subdomain]
+				s.mu.RUnlock()
+				if !exists && !isReserved {
+					break
+				}
 			}
-			if tokenUsed != expectedToken {
-				writeWSError(conn, fmt.Sprintf("subdomain %q is reserved", subdomain))
-				conn.Close()
-				return
+		} else {
+			// Check if the subdomain is reserved
+			s.mu.RLock()
+			expectedToken, isReserved := s.reservedSubdomains[subdomain]
+			s.mu.RUnlock()
+			if isReserved {
+				var tokenUsed string
+				if authHeader := r.Header.Get("Authorization"); authHeader != "" {
+					var err error
+					tokenUsed, err = ServShared.ExtractTokenFromHeader(authHeader)
+					if err != nil {
+						tokenUsed = strings.TrimPrefix(authHeader, "Bearer ")
+						tokenUsed = strings.TrimSpace(tokenUsed)
+					}
+				}
+				if tokenUsed == "" {
+					tokenUsed = r.URL.Query().Get("token")
+				}
+				if tokenUsed != expectedToken {
+					writeWSError(conn, fmt.Sprintf("subdomain %q is reserved", subdomain))
+					conn.Close()
+					return
+				}
 			}
 		}
 	}
@@ -411,15 +442,24 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("Tunnel registered: %s (custom: %s, tcp: %d) → %s", subdomain, customDomain, tcpPort, publicURL)
 
+	s.mu.Lock()
+	token, exists := s.resumptionTokens[subdomain]
+	if !exists {
+		token = fmt.Sprintf("resume-%s-%d", subdomain, time.Now().UnixNano())
+		s.resumptionTokens[subdomain] = token
+	}
+	s.mu.Unlock()
+
 	// Send confirmation.
 	tc.mu.Lock()
 	_ = conn.WriteJSON(tunnel.Envelope{
 		Type: tunnel.TypeRegistered,
 		Control: &tunnel.ControlMessage{
-			Subdomain:    subdomain,
-			CustomDomain: customDomain,
-			PublicURL:    publicURL,
-			TCPPort:      tcpPort,
+			Subdomain:       subdomain,
+			CustomDomain:    customDomain,
+			PublicURL:       publicURL,
+			TCPPort:         tcpPort,
+			ResumptionToken: token,
 		},
 	})
 	tc.mu.Unlock()
@@ -429,19 +469,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Cleanup on disconnect.
 	s.mu.Lock()
-	delete(s.tunnels, subdomain)
-	if customDomain != "" {
-		delete(s.customTunnels, customDomain)
-	}
-	if tcpPort > 0 {
-		if l, exists := s.tcpListeners[tcpPort]; exists {
-			l.Close()
-			delete(s.tcpListeners, tcpPort)
+	if currTc, exists := s.tunnels[subdomain]; exists && currTc == tc {
+		delete(s.tunnels, subdomain)
+		if customDomain != "" {
+			delete(s.customTunnels, customDomain)
 		}
+		if tcpPort > 0 {
+			if l, exists := s.tcpListeners[tcpPort]; exists {
+				l.Close()
+				delete(s.tcpListeners, tcpPort)
+			}
+		}
+		log.Printf("Tunnel disconnected: %s (custom: %s)", subdomain, customDomain)
+	} else {
+		log.Printf("Tunnel cleanup bypassed for session resumed subdomain: %s", subdomain)
 	}
 	s.mu.Unlock()
 	conn.Close()
-	log.Printf("Tunnel disconnected: %s (custom: %s)", subdomain, customDomain)
 }
 
 // readLoop reads messages from a tunnel client.
@@ -528,18 +572,43 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Check sharing basic authentication
 	if tc.sharingAuth != "" {
-		username, password, ok := r.BasicAuth()
-		parts := strings.SplitN(tc.sharingAuth, ":", 2)
-		expectedUser := parts[0]
-		expectedPass := ""
-		if len(parts) > 1 {
-			expectedPass = parts[1]
+		inviteToken := r.URL.Query().Get("invite_token")
+		inviteValid := false
+		if inviteToken != "" {
+			parts := strings.SplitN(inviteToken, ".", 2)
+			if len(parts) == 2 {
+				expiresStr := parts[0]
+				sig := parts[1]
+				expires, err := strconv.ParseInt(expiresStr, 10, 64)
+				if err == nil && expires > time.Now().Unix() {
+					secret := s.jwtSecret
+					if secret == "" {
+						secret = "default-invite-secret-xyz"
+					}
+					mac := hmac.New(sha256.New, []byte(secret))
+					mac.Write([]byte(fmt.Sprintf("%s:%d", subdomain, expires)))
+					expectedSig := hex.EncodeToString(mac.Sum(nil))
+					if sig == expectedSig {
+						inviteValid = true
+					}
+				}
+			}
 		}
-		if !ok || username != expectedUser || password != expectedPass {
-			otel.EndSpan(span, fmt.Errorf("unauthorized sharing access"), nil)
-			w.Header().Set("WWW-Authenticate", `Basic realm="ServTunnel Share"`)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
+
+		if !inviteValid {
+			username, password, ok := r.BasicAuth()
+			parts := strings.SplitN(tc.sharingAuth, ":", 2)
+			expectedUser := parts[0]
+			expectedPass := ""
+			if len(parts) > 1 {
+				expectedPass = parts[1]
+			}
+			if !ok || username != expectedUser || password != expectedPass {
+				otel.EndSpan(span, fmt.Errorf("unauthorized sharing access"), nil)
+				w.Header().Set("WWW-Authenticate", `Basic realm="ServTunnel Share"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
 		}
 	}
 
@@ -914,4 +983,47 @@ func (s *Server) handleTCPConnection(tc *tunnelConn, clientConn net.Conn) {
 			}
 		}
 	}
+}
+
+func (s *Server) handleTunnelsSubroutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/tunnels/")
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 && parts[1] == "invite" {
+		s.handleGenerateInvite(w, r, parts[0])
+		return
+	}
+	http.NotFound(w, r)
+}
+
+func (s *Server) handleGenerateInvite(w http.ResponseWriter, r *http.Request, subdomain string) {
+	s.mu.RLock()
+	_, exists := s.tunnels[subdomain]
+	s.mu.RUnlock()
+	if !exists {
+		http.Error(w, `{"error":"tunnel not found"}`, http.StatusNotFound)
+		return
+	}
+
+	secret := s.jwtSecret
+	if secret == "" {
+		secret = "default-invite-secret-xyz"
+	}
+	
+	expires := time.Now().Add(24 * time.Hour).Unix()
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(fmt.Sprintf("%s:%d", subdomain, expires)))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	inviteToken := fmt.Sprintf("%d.%s", expires, sig)
+	inviteURL := fmt.Sprintf("http://%s.%s%s/?invite_token=%s", subdomain, s.baseDomain, s.addr, inviteToken)
+	if strings.Contains(s.addr, ":") && !strings.HasPrefix(s.addr, ":") {
+		inviteURL = fmt.Sprintf("http://%s.%s/?invite_token=%s", subdomain, s.baseDomain, inviteToken)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"subdomain":    subdomain,
+		"invite_token": inviteToken,
+		"invite_url":   inviteURL,
+	})
 }

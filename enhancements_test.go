@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,7 +17,10 @@ import (
 
 	"servtunnel/pkg/client"
 	"servtunnel/pkg/inspector"
+	"servtunnel/pkg/server"
+	"servtunnel/pkg/tunnel"
 
+	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v3"
 )
 
@@ -216,5 +223,189 @@ func TestLocalReplay(t *testing.T) {
 	decodedBody, _ := base64.StdEncoding.DecodeString(newEntry.ResponseBody)
 	if string(decodedBody) != "local-response" {
 		t.Errorf("Expected body 'local-response', got %s", decodedBody)
+	}
+}
+
+func TestPersistentTunnelsInvitesAndCustomDomain(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	relayAddr := ln.Addr().String()
+	ln.Close()
+
+	relayPort := strings.Split(relayAddr, ":")[1]
+	relaySrv := server.NewServer(":"+relayPort, "localhost", inspector.New(10))
+	
+	os.Setenv("SERVTUNNEL_TOKEN", "my-test-token")
+	defer os.Unsetenv("SERVTUNNEL_TOKEN")
+
+	go func() {
+		_ = relaySrv.Start()
+	}()
+	time.Sleep(200 * time.Millisecond)
+	defer relaySrv.Shutdown(context.Background())
+
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%s/ws/connect?token=my-test-token", relayPort)
+	
+	dialer := &websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	ws1, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect ws1: %v", err)
+	}
+	
+	err = ws1.WriteJSON(tunnel.Envelope{
+		Type: tunnel.TypeRegister,
+		Control: &tunnel.ControlMessage{
+			Subdomain:   "persistsub",
+			SharingAuth: "user:pass",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to register ws1: %v", err)
+	}
+
+	var resp1 tunnel.Envelope
+	if err := ws1.ReadJSON(&resp1); err != nil || resp1.Type != tunnel.TypeRegistered {
+		t.Fatalf("Failed to get registered response: %v", err)
+	}
+
+	resToken := resp1.Control.ResumptionToken
+	if resToken == "" {
+		t.Errorf("Expected non-empty ResumptionToken")
+	}
+
+	ws2, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect ws2: %v", err)
+	}
+	defer ws2.Close()
+
+	err = ws2.WriteJSON(tunnel.Envelope{
+		Type: tunnel.TypeRegister,
+		Control: &tunnel.ControlMessage{
+			Subdomain:       "persistsub",
+			ResumptionToken: resToken,
+			SharingAuth:     "user:pass",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to register ws2: %v", err)
+	}
+
+	var resp2 tunnel.Envelope
+	if err := ws2.ReadJSON(&resp2); err != nil || resp2.Type != tunnel.TypeRegistered {
+		t.Fatalf("Failed to resume session: %v", err)
+	}
+
+	var ws1Msg tunnel.Envelope
+	err = ws1.ReadJSON(&ws1Msg)
+	if err == nil {
+		t.Errorf("Expected ws1 to be closed by server, but read succeeded: %+v", ws1Msg)
+	}
+	ws1.Close()
+
+	inviteURL := fmt.Sprintf("http://127.0.0.1:%s/api/tunnels/persistsub/invite", relayPort)
+	reqInv, _ := http.NewRequest("GET", inviteURL, nil)
+	reqInv.Header.Set("Authorization", "Bearer my-test-token")
+	respInv, err := http.DefaultClient.Do(reqInv)
+	if err != nil || respInv.StatusCode != http.StatusOK {
+		t.Fatalf("Failed to generate invite: %v, status: %d", err, respInv.StatusCode)
+	}
+	defer respInv.Body.Close()
+
+	var inviteRes map[string]string
+	json.NewDecoder(respInv.Body).Decode(&inviteRes)
+	inviteToken := inviteRes["invite_token"]
+
+	if inviteToken == "" {
+		t.Fatalf("Invalid invite response: %+v", inviteRes)
+	}
+
+	tunnelReqURL := fmt.Sprintf("http://127.0.0.1:%s/?invite_token=%s", relayPort, inviteToken)
+	reqTunnel, _ := http.NewRequest("GET", tunnelReqURL, nil)
+	reqTunnel.Host = "persistsub.localhost"
+
+	go func() {
+		var reqEnv tunnel.Envelope
+		if err := ws2.ReadJSON(&reqEnv); err == nil && reqEnv.Type == tunnel.TypeRequest {
+			_ = ws2.WriteJSON(tunnel.Envelope{
+				Type:      tunnel.TypeResponse,
+				RequestID: reqEnv.RequestID,
+				Response: &tunnel.TunnelResponse{
+					StatusCode: http.StatusOK,
+					Body:       base64.StdEncoding.EncodeToString([]byte("response-via-invite")),
+				},
+			})
+		}
+	}()
+
+	respTunnel, err := http.DefaultClient.Do(reqTunnel)
+	if err != nil {
+		t.Fatalf("Failed to fetch tunnel via invite: %v", err)
+	}
+	defer respTunnel.Body.Close()
+
+	if respTunnel.StatusCode != http.StatusOK {
+		t.Errorf("Expected tunnel status 200 via invite, got %d", respTunnel.StatusCode)
+	}
+
+	tunnelBody, _ := io.ReadAll(respTunnel.Body)
+	if string(tunnelBody) != "response-via-invite" {
+		t.Errorf("Expected response-via-invite, got %s", tunnelBody)
+	}
+
+	wsCustom, _, err := dialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("Failed to connect wsCustom: %v", err)
+	}
+	defer wsCustom.Close()
+
+	err = wsCustom.WriteJSON(tunnel.Envelope{
+		Type: tunnel.TypeRegister,
+		Control: &tunnel.ControlMessage{
+			Subdomain:    "customsub",
+			CustomDomain: "my-custom-domain.com",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to register wsCustom: %v", err)
+	}
+
+	var respCustom tunnel.Envelope
+	if err := wsCustom.ReadJSON(&respCustom); err != nil || respCustom.Type != tunnel.TypeRegistered {
+		t.Fatalf("Failed to register custom domain tunnel: %v", err)
+	}
+
+	reqDomain, _ := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%s/", relayPort), nil)
+	reqDomain.Host = "my-custom-domain.com"
+
+	go func() {
+		var reqEnv tunnel.Envelope
+		if err := wsCustom.ReadJSON(&reqEnv); err == nil && reqEnv.Type == tunnel.TypeRequest {
+			_ = wsCustom.WriteJSON(tunnel.Envelope{
+				Type:      tunnel.TypeResponse,
+				RequestID: reqEnv.RequestID,
+				Response: &tunnel.TunnelResponse{
+					StatusCode: http.StatusOK,
+					Body:       base64.StdEncoding.EncodeToString([]byte("response-via-custom-domain")),
+				},
+			})
+		}
+	}()
+
+	respDomain, err := http.DefaultClient.Do(reqDomain)
+	if err != nil {
+		t.Fatalf("Failed to fetch tunnel via custom domain: %v", err)
+	}
+	defer respDomain.Body.Close()
+
+	if respDomain.StatusCode != http.StatusOK {
+		t.Errorf("Expected tunnel status 200 via custom domain, got %d", respDomain.StatusCode)
+	}
+
+	domainBody, _ := io.ReadAll(respDomain.Body)
+	if string(domainBody) != "response-via-custom-domain" {
+		t.Errorf("Expected response-via-custom-domain, got %s", domainBody)
 	}
 }
