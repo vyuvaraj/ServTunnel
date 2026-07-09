@@ -59,7 +59,7 @@
 - [x] Multi-relay federation (distribute tunnels across regions) [July 9, 2026]
 - [x] Persistent tunnel names (reserved subdomains)
 - [x] Usage analytics and billing integration [July 9, 2026]
-- [ ] Enterprise features (SSO, audit logging, IP allowlists)
+- [x] Enterprise features (SSO, audit logging, IP allowlists) [July 9, 2026]
 
 
 ## Phase 4: Enterprise Tunneling (Next Level)
