@@ -98,6 +98,29 @@ The request will be forwarded to `http://localhost:8080/api/hello` through the t
 
 ---
 
+## Standalone Tunnel (ngrok / Localtunnel Alternative)
+
+ServTunnel works as a generic, zero-dependency, self-hosted alternative to ngrok, localtunnel, or cloudflared. You can use it to expose **any local HTTP server** (Python Flask, Node Express, React Dev Server, Go API, PHP, etc.) to the local network or public internet.
+
+### Expose Any Local App/Service
+
+Simply compile or download `servtunnel`, launch your local application, and run the tunnel client:
+
+1. **Start your local web app** (e.g. Node Express on port `3000`):
+   ```bash
+   npm run dev # listening on http://localhost:3000
+   ```
+
+2. **Expose port 3000** using a public or shared ServTunnel relay server:
+   ```bash
+   ./servtunnel client 3000 --relay ws://relay.yourdomain.com:8443/ws/connect --subdomain dev-app
+   ```
+
+3. **Access publicly**:
+   Your app is now securely exposed at:
+   `http://dev-app.relay.yourdomain.com:8443`
+
+
 ## Management APIs
 
 ### List Active Tunnels
