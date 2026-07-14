@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/vyuvaraj/ServShared v0.1.1-0.20260709055203-a69c44124438
+	github.com/vyuvaraj/ServShared v1.0.2-0.20260714131806-8f86487bce70
 	golang.org/x/crypto v0.53.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -14,4 +14,3 @@ require (
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
 )
-replace github.com/vyuvaraj/ServShared => ../ServShared
