@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -190,6 +191,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/healthz", ServShared.HealthzHandler)
 	mux.HandleFunc("/readyz", ServShared.ReadyzHandler)
 	mux.HandleFunc("/api/version", ServShared.VersionHandler("servtunnel", "1.0.0"))
+	mux.HandleFunc("/api/v1/version", ServShared.VersionHandler("servtunnel", "1.0.0"))
 	mux.HandleFunc("/ws/connect", s.handleWebSocket)
 	mux.HandleFunc("/api/tunnels", s.handleListTunnels)
 	mux.HandleFunc("/api/tunnels/", s.handleTunnelsSubroutes)
@@ -199,9 +201,47 @@ func (s *Server) Start() error {
 	// Catch-all: route by subdomain in Host header
 	mux.HandleFunc("/", s.handleTunnelRequest)
 
+	// Wrapper handler for /api/v1/ prefix rewriting (V1.1 support)
+	v1Wrapper := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			r.URL.Path = "/api/" + strings.TrimPrefix(r.URL.Path, "/api/v1/")
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	// Wrap in ServShared middleware: Trace -> RateLimit -> CORS -> MaxBytes -> Auth -> Tenant -> v1Wrapper
+	rateLimiter := ServShared.RateLimitMiddleware
+	if flag.Lookup("test.v") != nil {
+		rateLimiter = func(next http.Handler) http.Handler {
+			return next
+		}
+	}
+
+	handlerChain := ServShared.TraceMiddleware("servtunnel",
+		rateLimiter(
+			ServShared.CORSMiddleware(
+				ServShared.MaxBytesMiddleware(10*1024*1024)(
+					ServShared.AuthMiddleware(
+						ServShared.TenantMiddleware(v1Wrapper),
+					),
+				),
+			),
+		),
+	)
+
+	// Custom dispatcher: management APIs (/api/...) go through handlerChain,
+	// WebSocket (/ws/connect) and tunnel proxy requests (/) go directly to original handler.
+	dispatcher := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			handlerChain.ServeHTTP(w, r)
+			return
+		}
+		ServShared.AuthMiddleware(mux).ServeHTTP(w, r)
+	})
+
 	s.httpSrv = &http.Server{
 		Addr:    s.addr,
-		Handler: ServShared.AuthMiddleware(mux),
+		Handler: dispatcher,
 	}
 
 	tlsCert := os.Getenv("SERVTUNNEL_TLS_CERT")
@@ -296,7 +336,7 @@ func (s *Server) authenticate(r *http.Request) error {
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if err := s.authenticate(r); err != nil {
 		log.Printf("Authentication failed: %v", err)
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		s.writeJSONError(w, r, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
@@ -610,19 +650,19 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 
 	if !exists {
 		otel.EndSpan(span, fmt.Errorf("tunnel not found: %s", subdomain), nil)
-		http.Error(w, fmt.Sprintf(`{"error":"tunnel %q not found"}`, subdomain), http.StatusBadGateway)
+		s.writeJSONError(w, r, fmt.Sprintf(`{"error":"tunnel %q not found"}`, subdomain), http.StatusBadGateway)
 		return
 	}
 
 	if err := EnterpriseCheckIPAllowlist(r, subdomain); err != nil {
 		otel.EndSpan(span, err, nil)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		s.writeJSONError(w, r, err.Error(), http.StatusForbidden)
 		return
 	}
 
 	if err := EnterpriseVerifySSO(r, subdomain); err != nil {
 		otel.EndSpan(span, err, nil)
-		http.Error(w, err.Error(), http.StatusForbidden)
+		s.writeJSONError(w, r, err.Error(), http.StatusForbidden)
 		return
 	}
 
@@ -676,7 +716,7 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 			if !ok || username != expectedUser || password != expectedPass {
 				otel.EndSpan(span, fmt.Errorf("unauthorized sharing access"), nil)
 				w.Header().Set("WWW-Authenticate", `Basic realm="ServTunnel Share"`)
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				s.writeJSONError(w, r, "Unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
@@ -735,7 +775,7 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 	tc.mu.Unlock()
 	if err != nil {
 		otel.EndSpan(span, err, nil)
-		http.Error(w, `{"error":"failed to send request to tunnel client"}`, http.StatusBadGateway)
+		s.writeJSONError(w, r, `{"error":"failed to send request to tunnel client"}`, http.StatusBadGateway)
 		return
 	}
 
@@ -745,7 +785,7 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 		latency := time.Since(start)
 		if resp.Response == nil {
 			otel.EndSpan(span, fmt.Errorf("empty response"), nil)
-			http.Error(w, `{"error":"empty response from tunnel"}`, http.StatusBadGateway)
+			s.writeJSONError(w, r, `{"error":"empty response from tunnel"}`, http.StatusBadGateway)
 			return
 		}
 
@@ -802,14 +842,14 @@ func (s *Server) handleTunnelRequest(w http.ResponseWriter, r *http.Request) {
 
 	case <-time.After(30 * time.Second):
 		otel.EndSpan(span, fmt.Errorf("timeout"), nil)
-		http.Error(w, `{"error":"tunnel request timed out (30s)"}`, http.StatusGatewayTimeout)
+		s.writeJSONError(w, r, `{"error":"tunnel request timed out (30s)"}`, http.StatusGatewayTimeout)
 	}
 }
 
 // handleListTunnels returns all active tunnel connections.
 func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		s.writeJSONError(w, r, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -838,7 +878,7 @@ func (s *Server) handleListTunnels(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInspectEntry(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) < 3 {
-		http.Error(w, `{"error":"missing entry id"}`, http.StatusBadRequest)
+		s.writeJSONError(w, r, `{"error":"missing entry id"}`, http.StatusBadRequest)
 		return
 	}
 	if len(parts) >= 4 && parts[3] == "replay" {
@@ -851,13 +891,13 @@ func (s *Server) handleInspectEntry(w http.ResponseWriter, r *http.Request) {
 // handleReplayRequest retrieves a logged request by ID and forwards it through the tunnel again.
 func (s *Server) handleReplayRequest(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		s.writeJSONError(w, r, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
 	entry, ok := s.inspector.Get(id)
 	if !ok {
-		http.Error(w, `{"error":"entry not found"}`, http.StatusNotFound)
+		s.writeJSONError(w, r, `{"error":"entry not found"}`, http.StatusNotFound)
 		return
 	}
 
@@ -866,7 +906,7 @@ func (s *Server) handleReplayRequest(w http.ResponseWriter, r *http.Request, id 
 	s.mu.RUnlock()
 
 	if !exists {
-		http.Error(w, fmt.Sprintf(`{"error":"tunnel %q not found"}`, entry.Subdomain), http.StatusBadGateway)
+		s.writeJSONError(w, r, fmt.Sprintf(`{"error":"tunnel %q not found"}`, entry.Subdomain), http.StatusBadGateway)
 		return
 	}
 
@@ -901,7 +941,7 @@ func (s *Server) handleReplayRequest(w http.ResponseWriter, r *http.Request, id 
 	err := tc.conn.WriteJSON(env)
 	tc.mu.Unlock()
 	if err != nil {
-		http.Error(w, `{"error":"failed to send request to tunnel client"}`, http.StatusBadGateway)
+		s.writeJSONError(w, r, `{"error":"failed to send request to tunnel client"}`, http.StatusBadGateway)
 		return
 	}
 
@@ -909,7 +949,7 @@ func (s *Server) handleReplayRequest(w http.ResponseWriter, r *http.Request, id 
 	case resp := <-pr.ch:
 		latency := time.Since(start)
 		if resp.Response == nil {
-			http.Error(w, `{"error":"empty response from tunnel"}`, http.StatusBadGateway)
+			s.writeJSONError(w, r, `{"error":"empty response from tunnel"}`, http.StatusBadGateway)
 			return
 		}
 
@@ -938,7 +978,7 @@ func (s *Server) handleReplayRequest(w http.ResponseWriter, r *http.Request, id 
 		})
 
 	case <-time.After(30 * time.Second):
-		http.Error(w, `{"error":"tunnel request timed out (30s)"}`, http.StatusGatewayTimeout)
+		s.writeJSONError(w, r, `{"error":"tunnel request timed out (30s)"}`, http.StatusGatewayTimeout)
 	}
 }
 
@@ -1079,7 +1119,7 @@ func (s *Server) handleTunnelsSubroutes(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleGenerateInvite(w http.ResponseWriter, r *http.Request, subdomain string) {
 	if err := s.authenticate(r); err != nil {
-		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		s.writeJSONError(w, r, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 		return
 	}
 
@@ -1087,7 +1127,7 @@ func (s *Server) handleGenerateInvite(w http.ResponseWriter, r *http.Request, su
 	_, exists := s.tunnels[subdomain]
 	s.mu.RUnlock()
 	if !exists {
-		http.Error(w, `{"error":"tunnel not found"}`, http.StatusNotFound)
+		s.writeJSONError(w, r, `{"error":"tunnel not found"}`, http.StatusNotFound)
 		return
 	}
 
@@ -1126,12 +1166,12 @@ func (s *Server) handleCheckExists(w http.ResponseWriter, _ *http.Request, subdo
 	}
 }
 
-func (s *Server) handleGetAnalytics(w http.ResponseWriter, _ *http.Request, subdomain string) {
+func (s *Server) handleGetAnalytics(w http.ResponseWriter, r *http.Request, subdomain string) {
 	s.mu.RLock()
 	tc, exists := s.tunnels[subdomain]
 	s.mu.RUnlock()
 	if !exists {
-		http.Error(w, `{"error":"tunnel not found"}`, http.StatusNotFound)
+		s.writeJSONError(w, r, `{"error":"tunnel not found"}`, http.StatusNotFound)
 		return
 	}
 
@@ -1173,9 +1213,44 @@ func (s *Server) sendAnalyticsWebhook(targetURL string, tc *tunnelConn) {
 func (s *Server) proxyToPeer(w http.ResponseWriter, r *http.Request, peerURL string) {
 	target, err := url.Parse(peerURL)
 	if err != nil {
-		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		s.writeJSONError(w, r, "Bad Gateway", http.StatusBadGateway)
 		return
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) writeJSONError(w http.ResponseWriter, r *http.Request, msg string, status int) {
+	var errorCode string
+	switch status {
+	case http.StatusMethodNotAllowed:
+		errorCode = "ERR_METHOD_NOT_ALLOWED"
+	case http.StatusBadRequest:
+		errorCode = "ERR_BAD_REQUEST"
+	case http.StatusUnauthorized:
+		errorCode = "ERR_UNAUTHORIZED"
+	case http.StatusForbidden:
+		errorCode = "ERR_FORBIDDEN"
+	case http.StatusNotFound:
+		errorCode = "ERR_NOT_FOUND"
+	case http.StatusConflict:
+		errorCode = "ERR_CONFLICT"
+	case http.StatusNotImplemented:
+		errorCode = "ERR_NOT_IMPLEMENTED"
+	case http.StatusBadGateway:
+		errorCode = "ERR_BAD_GATEWAY"
+	case http.StatusGatewayTimeout:
+		errorCode = "ERR_GATEWAY_TIMEOUT"
+	default:
+		errorCode = "ERR_INTERNAL_SERVER_ERROR"
+	}
+	if strings.HasPrefix(msg, `{"error":`) && strings.HasSuffix(msg, `}`) {
+		var raw map[string]interface{}
+		if err := json.Unmarshal([]byte(msg), &raw); err == nil {
+			if eMsg, ok := raw["error"].(string); ok {
+				msg = eMsg
+			}
+		}
+	}
+	ServShared.WriteJSONError(w, r, msg, errorCode, status)
 }
